@@ -2429,6 +2429,14 @@ def run_interactive_loop(
                 user_input = initial_user_input
                 initial_user_input = None
             else:
+                if config and config.hooks:
+                    for hook in config.hooks.get("on_waiting_for_input", []):
+                        cmd = hook.get("command")
+                        if cmd:
+                            try:
+                                subprocess.Popen(cmd, shell=True)
+                            except Exception as e:
+                                logging.warning(f"Failed to run on_waiting_for_input hook: {e}")
                 user_input = session.prompt(input_prompt, style=style)  # type: ignore
 
             if user_input.startswith("/"):
@@ -2801,6 +2809,15 @@ def run_interactive_loop(
             )
 
             console.print("")
+
+            if config and config.hooks:
+                for hook in config.hooks.get("on_turn_complete", []):
+                    cmd = hook.get("command")
+                    if cmd:
+                        try:
+                            subprocess.Popen(cmd, shell=True)
+                        except Exception as e:
+                            logging.warning(f"Failed to run on_turn_complete hook: {e}")
 
             # Save conversation after each AI response
             if json_output_file and messages:
