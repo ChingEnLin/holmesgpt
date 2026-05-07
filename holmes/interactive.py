@@ -2255,10 +2255,19 @@ def _run_hooks(hooks: Optional[dict], hook_name: str) -> None:
     """Fire-and-forget execution of configured lifecycle hook commands."""
     if not hooks:
         return
-    for hook in hooks.get(hook_name, []):
-        cmd = hook.get("command")
-        if cmd:
-            try:
+    bucket = hooks.get(hook_name)
+    if bucket is None:
+        return
+    if not isinstance(bucket, (list, tuple, set)):
+        logging.warning("Invalid %s hooks config (expected list, got %s)", hook_name, type(bucket).__name__)
+        return
+    for hook in bucket:
+        try:
+            if not isinstance(hook, dict):
+                logging.warning("Skipping invalid %s hook (expected dict, got %s)", hook_name, type(hook).__name__)
+                continue
+            cmd = hook.get("command")
+            if cmd:
                 subprocess.Popen(
                     cmd,
                     shell=True,
@@ -2266,8 +2275,8 @@ def _run_hooks(hooks: Optional[dict], hook_name: str) -> None:
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
                 )
-            except Exception as e:
-                logging.warning("Failed to run %s hook: %s", hook_name, e)
+        except Exception as e:
+            logging.warning("Failed to run %s hook: %s", hook_name, e)
 
 
 def run_interactive_loop(
