@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 import re
 import shutil
 import tempfile
@@ -976,9 +977,21 @@ class TestRunInteractiveLoop(unittest.TestCase):
         )
         
         # Verify that on_waiting_for_input hook fired
-        mock_popen.assert_any_call("echo 'waiting'", shell=True)
+        mock_popen.assert_any_call(
+            "echo 'waiting'",
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
         # Verify that on_turn_complete hook fired
-        mock_popen.assert_any_call("echo 'completed'", shell=True)
+        mock_popen.assert_any_call(
+            "echo 'completed'",
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
 
 
 
