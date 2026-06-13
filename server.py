@@ -27,7 +27,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from litellm.exceptions import AuthenticationError
-
 from holmes import get_version, is_official_release
 from holmes.common.env_vars import (
     DEVELOPMENT_MODE,
@@ -70,6 +69,12 @@ from holmes.core.tools_utils.frontend_tools import (
     inject_frontend_tools,
 )
 from holmes.core.tracing import TracingFactory
+from holmes.core.usage_recorder import (
+    build_chat_recorder_state,
+    record_error,
+    record_from_llm_result,
+    stream_with_usage_recording,
+)
 from holmes.utils.stream import stream_chat_formatter
 
 
@@ -118,7 +123,7 @@ def init_config():
         tuple: (config, dal) - The initialized Config object and its DAL instance
     """
     default_config_path = Path(DEFAULT_CONFIG_LOCATION)
-    if default_config_path.exists():
+    if default_config_path.exists() and os.environ.get("LOAD_CONFIG_FROM_ENV", "false").lower() == "false":
         logging.info(f"Loading config from file: {default_config_path}")
         config = Config.load_from_file(default_config_path)
     else:
@@ -273,7 +278,11 @@ if HOLMES_API_KEY:
     @app.middleware("http")
     async def api_key_auth(request: Request, call_next):
         """Reject requests missing a valid API key (X-API-Key or Bearer token)."""
-        if request.url.path in AUTH_EXEMPT_PATHS:
+        # Use the raw ASGI scope path, not request.url.path. The latter is
+        # reconstructed from the (attacker-controlled) Host header and can be
+        # spoofed via a malformed Host to bypass this exemption check
+        # (CVE-2026-48710 / GHSA-86qp-5c8j-p5mr).
+        if request.scope.get("path", "") in AUTH_EXEMPT_PATHS:
             return await call_next(request)
 
         key = extract_api_key(request)
@@ -446,6 +455,14 @@ def chat(chat_request: ChatRequest, http_request: Request):
         if chat_request.user_id:
             request_context.setdefault("headers", {})
             request_context["user_id"] = chat_request.user_id
+        # Surface conversation_id and cluster_name to toolsets that need
+        # to hardwire them into outbound requests (e.g. platform-mcp adds
+        # them as X-Robusta-* headers so tool handlers don't have to trust
+        # the LLM-supplied arguments).
+        if chat_request.conversation_id:
+            request_context["conversation_id"] = chat_request.conversation_id
+        if config.cluster_name:
+            request_context["cluster_name"] = config.cluster_name
 
         storage = tool_result_storage()
         tool_results_dir = storage.__enter__()
@@ -517,7 +534,12 @@ def chat(chat_request: ChatRequest, http_request: Request):
                 inv_attrs = {"gen_ai_request_model": chat_request.model or config.model or "unknown"}
                 otel_metrics.investigation_count.add(1, inv_attrs)
 
-            stream = stream_chat_formatter(
+            # Build the usage recorder state and wrap the raw stream BEFORE the
+            # SSE formatter so the wrapper sees Holmes' native StreamMessage events.
+            recorder_state = build_chat_recorder_state(
+                chat_request, request_ai, dal=dal, is_streaming=True
+            )
+            recorded_stream = stream_with_usage_recording(
                 request_ai.call_stream(
                     msgs=messages,
                     enable_tool_approval=chat_request.enable_tool_approval or False,
@@ -527,6 +549,10 @@ def chat(chat_request: ChatRequest, http_request: Request):
                     request_context=request_context,
                     trace_span=trace_span,
                 ),
+                recorder_state,
+            )
+            stream = stream_chat_formatter(
+                recorded_stream,
                 [f.model_dump() for f in follow_up_actions],
                 model=chat_request.model or config.model,
             )
@@ -535,6 +561,9 @@ def chat(chat_request: ChatRequest, http_request: Request):
                 media_type="text/event-stream",
             )
         else:
+            recorder_state = build_chat_recorder_state(
+                chat_request, request_ai, dal=dal, is_streaming=False
+            )
             try:
                 # Use provided trace_span or create a root investigation span
                 trace_span = chat_request.trace_span
@@ -554,6 +583,9 @@ def chat(chat_request: ChatRequest, http_request: Request):
                     request_context=request_context,
                 )
 
+                # Record usage event for non-streaming path (fire-and-forget).
+                record_from_llm_result(recorder_state, llm_call)
+
                 # Record investigation metrics
                 otel_metrics = TracingFactory.get_metrics()
                 if otel_metrics:
@@ -572,14 +604,25 @@ def chat(chat_request: ChatRequest, http_request: Request):
                     )
                 else:
                     logging.info(f"Completed {req_info}")
+                # Surface request_id in the response metadata so the FE has a
+                # handle for the public.record_feedback() RPC later. Streaming
+                # path does the same via _inject_request_id in the stream wrapper.
+                response_metadata = dict(llm_call.metadata or {})
+                response_metadata["request_id"] = recorder_state.request_id
                 response = ChatResponse(
                     analysis=llm_call.result,
                     tool_calls=llm_call.tool_calls,
                     conversation_history=llm_call.messages,
                     follow_up_actions=follow_up_actions,
-                    metadata=llm_call.metadata,
+                    metadata=response_metadata,
                 )
                 return response
+            except Exception as e:
+                # Non-streaming path: record the failed event so it shows up in dashboards
+                # with status='error' / 'rate_limited'. Streaming path records via the
+                # wrapper's `finally` automatically.
+                record_error(recorder_state, e)
+                raise
             finally:
                 if trace_span is not None:
                     trace_span.end()
